@@ -5,8 +5,35 @@
 #include <linux/types.h>
 #include <linux/netfilter.h>		/* for NF_ACCEPT */
 #include <errno.h>
-
+#include <string.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
+
+// IP 헤더 구조체
+struct ip_header {
+    u_char ip_vhl;          // 버전 + 헤더 길이
+    u_char ip_tos;          // 서비스 타입
+    u_short ip_len;         // 전체 길이
+    u_short ip_id;          // Identification
+    u_short ip_off;         // Fragment offset
+    u_char ip_ttl;          // Time to Live
+    u_char ip_p;            // 프로토콜
+    u_short ip_sum;         // Checksum
+    struct in_addr ip_src;  // 출발지 주소
+    struct in_addr ip_dst;  // 목적지 주소
+};
+
+// TCP 헤더 구조체
+struct tcp_header {
+    u_short th_sport;       // 출발지 포트
+    u_short th_dport;       // 목적지 포트
+    u_int th_seq;          // Sequence number
+    u_int th_ack;          // Acknowledgement number
+    u_char th_offx2;       // Data offset
+    u_char th_flags;       // Flags
+    u_short th_win;        // Window
+    u_short th_sum;        // Checksum
+    u_short th_urp;        // Urgent pointer
+};
 
 void dump(unsigned char* buf, int size) {
     int i;
@@ -18,6 +45,31 @@ void dump(unsigned char* buf, int size) {
     printf("\n");
 }
 
+char* target_host;
+
+static int check_http_host(unsigned char* data, int size) {
+    char* http_data = (char*)data;
+    char* host_field = strstr(http_data, "Host: ");
+
+    if (host_field) {
+        char host[256] = {0,};
+        sscanf(host_field + 6, "%255[^\r\n]", host);
+
+        char* newline = strchr(host, '\r');
+        if (newline) *newline = '\0';
+        newline = strchr(host, '\n');
+        if (newline) *newline = '\0';
+
+        printf("Found Host: %s\n", host);
+
+        if (strcasecmp(host, target_host) == 0) {
+            printf("Matched target host! Dropping packet.\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* returns packet id */
 static u_int32_t print_pkt (struct nfq_data *tb)
 {
@@ -26,6 +78,7 @@ static u_int32_t print_pkt (struct nfq_data *tb)
 	struct nfqnl_msg_packet_hw *hwph;
 	u_int32_t mark,ifi;
 	int ret;
+    int blocked = 0;
 	unsigned char *data;
 
 	ph = nfq_get_msg_packet_hdr(tb);
@@ -68,6 +121,27 @@ static u_int32_t print_pkt (struct nfq_data *tb)
     if (ret >= 0){
 		printf("payload_len=%d\n", ret);
         dump(data, ret);
+
+        struct ip_header *iph = (struct ip_header *)data;
+
+        int ip_header_len = (iph->ip_vhl & 0x0f) * 4;
+
+        if (iph->ip_p == 6) {
+            struct tcp_header *tcph = (struct tcp_header *)(data + ip_header_len);
+
+            int tcp_header_len = ((tcph->th_offx2 & 0xf0) >> 4) * 4;
+
+            if (ntohs(tcph->th_dport) == 80) {
+                unsigned char *http_data = data + ip_header_len + tcp_header_len;
+                int http_length = ret - ip_header_len - tcp_header_len;
+
+                if (http_length > 0 &&
+                    (strncmp((char*)http_data, "GET ", 4) == 0 ||
+                     strncmp((char*)http_data, "POST ", 5) == 0)) {
+                    blocked = check_http_host(http_data, http_length);
+                }
+            }
+        }
     }
 
 	fputc('\n', stdout);
@@ -76,16 +150,38 @@ static u_int32_t print_pkt (struct nfq_data *tb)
 }
 
 
-static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-	      struct nfq_data *nfa, void *data)
-{
-	u_int32_t id = print_pkt(nfa);
-	printf("entering callback\n");
-	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-}
+static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, void *data) {
+    u_int32_t id = print_pkt(nfa);
+    int blocked = 0;
 
+    unsigned char *payload_data;
+    int payload_len = nfq_get_payload(nfa, &payload_data);
+    if (payload_len >= 0) {
+        struct ip_header *iph = (struct ip_header *)payload_data;
+        if (iph->ip_p == 6) { // TCP
+            int ip_header_len = (iph->ip_vhl & 0x0f) * 4;
+            struct tcp_header *tcph = (struct tcp_header *)(payload_data + ip_header_len);
+            if (ntohs(tcph->th_dport) == 80) {
+                int tcp_header_len = ((tcph->th_offx2 & 0xf0) >> 4) * 4;
+                unsigned char *http_data = payload_data + ip_header_len + tcp_header_len;
+                int http_length = payload_len - ip_header_len - tcp_header_len;
+                blocked = check_http_host(http_data, http_length);
+            }
+        }
+    }
+
+    return nfq_set_verdict(qh, id, blocked ? NF_DROP : NF_ACCEPT, 0, NULL);
+}
 int main(int argc, char **argv)
 {
+    if (argc != 2) {
+        printf("Usage: %s <host_to_block>\n", argv[0]);
+        exit(1);
+    }
+
+    target_host = argv[1];
+    printf("Blocking traffic to host: %s\n", target_host);
+
 	struct nfq_handle *h;
 	struct nfq_q_handle *qh;
 	struct nfnl_handle *nh;
@@ -132,14 +228,8 @@ int main(int argc, char **argv)
 			printf("pkt received\n");
 			nfq_handle_packet(h, buf, rv);
 			continue;
-		}
-		/* if your application is too slow to digest the packets that
-		 * are sent from kernel-space, the socket buffer that we use
-		 * to enqueue packets may fill up returning ENOBUFS. Depending
-		 * on your application, this error may be ignored. nfq_nlmsg_verdict_putPlease, see
-		 * the doxygen documentation of this library on how to improve
-		 * this situation.
-		 */
+        }
+
 		if (rv < 0 && errno == ENOBUFS) {
 			printf("losing packets!\n");
 			continue;
